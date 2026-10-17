@@ -1,0 +1,7 @@
+.env
+.env.*
+!.env.example
+coverage.out
+*.log
+.cache/
+.gocache*/

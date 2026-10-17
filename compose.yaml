@@ -1,0 +1,139 @@
+name: jungle-local
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-jungle}
+      POSTGRES_USER: ${POSTGRES_USER:-jungle}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jungle-local-only}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [local]
+
+  redis:
+    image: redis:7.4.2-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [local]
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3.3
+    command: ["start-dev", "--import-realm", "--http-port=8080"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin-local-only}
+      KC_HOSTNAME: ${KEYCLOAK_HOSTNAME:-http://host.docker.internal:${KEYCLOAK_PORT:-8081}}
+      KC_HOSTNAME_STRICT: "false"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "${KEYCLOAK_PORT:-8081}:8080"
+    volumes:
+      - ./deploy/keycloak/realm-jungle.json:/opt/keycloak/data/import/realm-jungle.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/9000'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks: [local]
+
+  ministack:
+    image: ministackorg/ministack:v1.5.27
+    environment:
+      MINISTACK_REGION: ${AWS_REGION:-us-east-1}
+      MINISTACK_HOST: ${MINISTACK_HOST:-localhost}
+      PERSIST_STATE: "1"
+      STATE_DIR: /data/state
+      DOCKER_NETWORK: jungle-local
+    ports:
+      - "${MINISTACK_PORT:-4566}:4566"
+    volumes:
+      - ministack-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4566/_ministack/health', timeout=3)"]
+      interval: 5s
+      timeout: 4s
+      retries: 30
+    networks: [local]
+
+  ministack-init:
+    image: amazon/aws-cli:2.17.50
+    entrypoint: ["/bin/sh", "/scripts/init-sqs.sh"]
+    environment:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ENDPOINT_URL: http://ministack:4566
+    volumes:
+      - ./deploy/ministack/init-sqs.sh:/scripts/init-sqs.sh:ro
+    depends_on:
+      ministack:
+        condition: service_healthy
+    networks: [local]
+    restart: "no"
+
+  kind-bootstrap:
+    build:
+      context: .
+      dockerfile: deploy/kind/Dockerfile
+    environment:
+      KIND_CLUSTER: ${KIND_CLUSTER:-jungle-local}
+      KIND_CONFIG: /workspace/deploy/kind/kind.yaml
+      APP_IMAGE: ${APP_IMAGE:-jungle-backend:local}
+      APP_BUILD: ${APP_BUILD:-1}
+      POSTGRES_DB: ${POSTGRES_DB:-jungle}
+      POSTGRES_USER: ${POSTGRES_USER:-jungle}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jungle-local-only}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      OIDC_ISSUER: ${OIDC_ISSUER:-http://host.docker.internal:${KEYCLOAK_PORT:-8081}}
+      OIDC_REALM: jungle
+      OIDC_CLIENT_ID: jungle-api
+      OIDC_CLIENT_SECRET: jungle-api-secret-local-only
+      KEYCLOAK_PORT: ${KEYCLOAK_PORT:-8081}
+      MINISTACK_HOST: ${MINISTACK_HOST:-localhost}
+      MINISTACK_PORT: ${MINISTACK_PORT:-4566}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/workspace:ro
+    working_dir: /workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      ministack-init:
+        condition: service_completed_successfully
+    networks: [local]
+    restart: "no"
+
+volumes:
+  postgres-data:
+  redis-data:
+  ministack-data:
+
+networks:
+  local:
+    name: jungle-local

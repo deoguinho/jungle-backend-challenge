@@ -1,0 +1,40 @@
+{
+  "realm": "jungle",
+  "enabled": true,
+  "displayName": "Jungle Local Development",
+  "clients": [
+    {
+      "clientId": "jungle-api",
+      "name": "Jungle API local",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "jungle-api-secret-local-only",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "defaultClientScopes": ["profile", "email", "roles"]
+    },
+    {
+      "clientId": "jungle-provider-local",
+      "name": "Jungle Provider local",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "jungle-provider-secret-local-only",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "defaultClientScopes": ["profile", "email", "roles"]
+    }
+  ],
+  "roles": {
+    "client": {
+      "jungle-api": [
+        {"name": "provider:local", "description": "Local provider identity for development"}
+      ]
+    }
+  }
+}

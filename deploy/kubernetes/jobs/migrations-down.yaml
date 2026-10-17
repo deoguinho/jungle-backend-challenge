@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: database-migrations-down
+  namespace: jungle
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 180
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: jungle-backend:local
+          imagePullPolicy: IfNotPresent
+          command: ["/app/migrate"]
+          args: ["down", "1"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: local-credentials
+                  key: DATABASE_URL
