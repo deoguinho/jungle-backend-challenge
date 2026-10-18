@@ -16,6 +16,7 @@ import (
 	redisadapter "github.com/junglegaming/backend-challenge-go/internal/adapters/outbound/redis"
 	"github.com/junglegaming/backend-challenge-go/internal/application"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/config"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
 	"go.uber.org/fx"
 )
 
@@ -45,7 +46,7 @@ func main() {
 		fx.Provide(func(cache *redisadapter.Cache) application.IdempotencyCache { return cache }),
 		fx.Provide(application.NewOpenWallet, application.NewGetWallet, application.NewListWalletLedger, application.NewReconcileWallet, application.NewGetWagerTransaction, application.NewGetProviderWagerTransaction),
 		fx.Provide(func(uow application.UnitOfWork, ids application.IDGenerator, clock application.Clock, cache application.IdempotencyCache, cfg config.Config) *application.SubmitWager {
-			return application.NewSubmitWager(uow, ids, clock, cache, cfg.IdempotencyTTL)
+			return application.NewSubmitWager(uow, ids, clock, cache, cfg.IdempotencyTTL, metrics.Default)
 		}),
 		fx.Provide(func(open *application.OpenWallet, get *application.GetWallet, list *application.ListWalletLedger, reconcile *application.ReconcileWallet, submit *application.SubmitWager, getWager *application.GetWagerTransaction, getProvider *application.GetProviderWagerTransaction) httpapi.UseCases {
 			return httpapi.UseCases{OpenWallet: open, GetWallet: get, ListLedger: list, Reconcile: reconcile, SubmitWager: submit, GetWager: getWager, GetProviderWager: getProvider}
@@ -85,7 +86,7 @@ func startHTTP(lc fx.Lifecycle, cfg config.Config, db *pgadapter.DB, sqs *awsada
 		}
 		return sqs.Check(ctx, cfg.SQSQueueURL)
 	}
-	handler := httpapi.NewServer(auth, cases, ready, logger)
+	handler := httpapi.NewServer(auth, cases, ready, logger, cfg.CORSAllowedOrigins...)
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	var listener net.Listener
 	lc.Append(fx.Hook{OnStart: func(context.Context) error {

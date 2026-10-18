@@ -28,6 +28,7 @@ type Tx interface {
 	Transactions() TransactionStore
 	Ledger() LedgerStore
 	Outbox() OutboxStore
+	Inbox() InboxStore
 }
 
 type WalletStore interface {
@@ -57,11 +58,18 @@ type TransactionStore interface {
 type LedgerStore interface {
 	Append(context.Context, *wallet.LedgerEntry) error
 	List(context.Context, string, string, int) (LedgerPage, error)
-	Sum(context.Context, string, string) (shared.Money, int64, error)
+	Reconcile(context.Context, string, string) (stored, calculated shared.Money, entries int64, err error)
 }
 
 type OutboxStore interface {
 	Append(context.Context, []Event) error
+}
+
+// InboxStore participates in the same unit of work as financial processing so
+// a message is complete only with its durable application result.
+type InboxStore interface {
+	Start(context.Context, string, string, []byte) (completed bool, err error)
+	Complete(context.Context, string, string, string, string) error
 }
 
 // IdempotencyCache is optional acceleration only. A miss/error never changes
@@ -69,6 +77,12 @@ type OutboxStore interface {
 type IdempotencyCache interface {
 	Get(context.Context, string) (CachedIdempotency, bool, error)
 	Put(context.Context, string, CachedIdempotency, time.Duration) error
+}
+
+// WagerObserver reports application outcomes without coupling use cases to a metrics vendor.
+type WagerObserver interface {
+	WagerResult(status string, replay bool, conflict bool, err error)
+	ObserveWagerDuration(elapsed time.Duration)
 }
 type CachedIdempotency struct{ TransactionID, PayloadHash string }
 

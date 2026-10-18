@@ -29,6 +29,13 @@ for node in $(kind get nodes --name "$cluster"); do
   fi
 done
 
+# kind exports a host-side kubeconfig endpoint (127.0.0.1:<ephemeral-port>).
+# The bootstrap runs in a Compose container, so use the control-plane node's
+# stable Compose-network DNS name instead.
+kind export kubeconfig --name "$cluster" >/dev/null
+kubectl config set-cluster "kind-$cluster" --server="https://${cluster}-control-plane:6443" >/dev/null
+kubectl --context "kind-$cluster" cluster-info >/dev/null
+
 gateway="$(docker network inspect "$compose_network" --format '{{(index .IPAM.Config 0).Gateway}}')"
 if [[ -z "$gateway" ]]; then
   echo "Could not resolve gateway for Docker network '$compose_network'" >&2
@@ -45,7 +52,10 @@ kubectl --context "kind-$cluster" -n jungle create configmap local-dependencies 
   --from-literal=AWS_ENDPOINT_URL="http://$gateway:${MINISTACK_PORT:-4566}" \
   --from-literal=AWS_REGION="${AWS_REGION:-us-east-1}" \
   --from-literal=OIDC_ISSUER="${OIDC_ISSUER:-http://host.docker.internal:8081}/realms/jungle" \
+  --from-literal=CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-http://localhost:8082,http://127.0.0.1:8082}" \
   --from-literal=SQS_QUEUE_URL="http://$gateway:${MINISTACK_PORT:-4566}/000000000000/wager-transactions.fifo" \
+  --from-literal=SQS_DLQ_URL="http://$gateway:${MINISTACK_PORT:-4566}/000000000000/wager-transactions-dlq.fifo" \
+  --from-literal=SQS_VISIBILITY_TIMEOUT=2 \
   --from-literal=SQS_EVENTS_QUEUE_URL="http://$gateway:${MINISTACK_PORT:-4566}/000000000000/wager-events.fifo" \
   --dry-run=client -o yaml | kubectl --context "kind-$cluster" -n jungle apply -f -
 
@@ -78,9 +88,11 @@ if docker image inspect "$image" >/dev/null 2>&1; then
     kubectl --context "kind-$cluster" -n jungle set image deployment/"$deployment" "$deployment"="$image"
     kubectl --context "kind-$cluster" -n jungle patch deployment "$deployment" --type=merge \
       -p "{\"spec\":{\"template\":{\"spec\":{\"hostAliases\":[{\"ip\":\"$gateway\",\"hostnames\":[\"host.docker.internal\"]}]}}}}"
+    kubectl --context "kind-$cluster" -n jungle rollout restart deployment/"$deployment"
+    kubectl --context "kind-$cluster" -n jungle rollout status deployment/"$deployment" --timeout=180s
   done
 else
   echo "Application image '$image' is not available; cluster and local dependency configuration are ready, but app workloads remain pending."
 fi
 
-echo "kind cluster '$cluster' is ready; API port mapping is http://localhost:8080"
+echo "kind cluster '$cluster' is ready; API port mapping is http://localhost:8088"

@@ -28,6 +28,7 @@ type SubmitWager struct {
 	clock    Clock
 	cache    IdempotencyCache
 	cacheTTL time.Duration
+	observer WagerObserver
 }
 
 // ConsumeWagerTransaction is the worker entry point. The adapter must supply
@@ -37,11 +38,44 @@ func (uc *SubmitWager) ConsumeWagerTransaction(ctx context.Context, providerID s
 	return uc.Execute(ctx, Principal{ProviderID: providerID, PlayerID: in.PlayerID, Internal: true}, in)
 }
 
-func NewSubmitWager(uow UnitOfWork, ids IDGenerator, clock Clock, cache IdempotencyCache, cacheTTL time.Duration) *SubmitWager {
-	return &SubmitWager{uow: uow, ids: ids, clock: clock, cache: cache, cacheTTL: cacheTTL}
+type InboxDelivery struct {
+	Consumer, MessageID string
+	PayloadHash         []byte
 }
 
-func (uc *SubmitWager) Execute(ctx context.Context, principal Principal, in SubmitWagerInput) (out WagerResult, err error) {
+// ConsumeWagerMessage atomically records inbox completion with the durable
+// wager result. The caller acknowledges SQS only after this method commits.
+func (uc *SubmitWager) ConsumeWagerMessage(ctx context.Context, providerID string, in SubmitWagerInput, delivery InboxDelivery) (WagerResult, error) {
+	if delivery.Consumer == "" || delivery.MessageID == "" || len(delivery.PayloadHash) != 32 {
+		return WagerResult{}, shared.Error("wager.inbox.invalid_delivery", shared.ErrInvalidArgument)
+	}
+	return uc.execute(ctx, Principal{ProviderID: providerID, PlayerID: in.PlayerID, Internal: true}, in, &delivery)
+}
+
+func NewSubmitWager(uow UnitOfWork, ids IDGenerator, clock Clock, cache IdempotencyCache, cacheTTL time.Duration, observers ...WagerObserver) *SubmitWager {
+	uc := &SubmitWager{uow: uow, ids: ids, clock: clock, cache: cache, cacheTTL: cacheTTL}
+	if len(observers) > 0 {
+		uc.observer = observers[0]
+	}
+	return uc
+}
+
+func (uc *SubmitWager) Execute(ctx context.Context, principal Principal, in SubmitWagerInput) (WagerResult, error) {
+	return uc.execute(ctx, principal, in, nil)
+}
+
+func (uc *SubmitWager) execute(ctx context.Context, principal Principal, in SubmitWagerInput, delivery *InboxDelivery) (out WagerResult, err error) {
+	started := time.Now()
+	defer func() {
+		if uc.observer != nil {
+			status := "ERROR"
+			if out.Transaction != nil {
+				status = string(out.Transaction.Status())
+			}
+			uc.observer.WagerResult(status, out.Replayed, errors.Is(err, ErrIdempotencyConflict), err)
+			uc.observer.ObserveWagerDuration(time.Since(started))
+		}
+	}()
 	if !principal.Internal {
 		if principal.ProviderID == "" || (principal.PlayerID != "" && in.PlayerID != "" && in.PlayerID != principal.PlayerID) {
 			return out, ErrUnauthorized
@@ -62,123 +96,149 @@ func (uc *SubmitWager) Execute(ctx context.Context, principal Principal, in Subm
 		cached, cacheHit, _ = uc.cache.Get(ctx, cacheKey)
 	}
 	err = uc.uow.Within(ctx, func(tx Tx) error {
-		if cacheHit && cached.TransactionID != "" {
-			if candidate, cacheErr := tx.Transactions().ByID(ctx, cached.TransactionID); cacheErr == nil && candidate.ProviderID() == principal.ProviderID && candidate.IdempotencyKey() == in.IdempotencyKey {
-				if candidate.PayloadHash() != in.PayloadHash {
+		if delivery != nil {
+			done, inboxErr := tx.Inbox().Start(ctx, delivery.Consumer, delivery.MessageID, delivery.PayloadHash)
+			if inboxErr != nil {
+				return inboxErr
+			}
+			if done {
+				existing, lookupErr := tx.Transactions().ByProviderIdempotency(ctx, principal.ProviderID, in.IdempotencyKey)
+				if lookupErr != nil {
+					return lookupErr
+				}
+				if existing.PayloadHash() != in.PayloadHash {
 					return ErrIdempotencyConflict
 				}
-				out = WagerResult{Transaction: candidate, Balance: candidate.ResultBalance(), Replayed: true, Pending: candidate.Status() == wagering.Pending || candidate.Status() == wagering.PendingReference}
+				out = WagerResult{Transaction: existing, Balance: existing.ResultBalance(), Replayed: true, Pending: existing.Status() == wagering.Pending || existing.Status() == wagering.PendingReference}
 				return nil
 			}
 		}
-		// PostgreSQL lookup is authoritative, including when Redis hits or fails.
-		existing, e := tx.Transactions().ByProviderIdempotency(ctx, principal.ProviderID, in.IdempotencyKey)
-		if e == nil {
-			if existing.PayloadHash() != in.PayloadHash {
-				return ErrIdempotencyConflict
+		operationErr := func() error {
+			if cacheHit && cached.TransactionID != "" {
+				if candidate, cacheErr := tx.Transactions().ByID(ctx, cached.TransactionID); cacheErr == nil && candidate.ProviderID() == principal.ProviderID && candidate.IdempotencyKey() == in.IdempotencyKey {
+					if candidate.PayloadHash() != in.PayloadHash {
+						return ErrIdempotencyConflict
+					}
+					out = WagerResult{Transaction: candidate, Balance: candidate.ResultBalance(), Replayed: true, Pending: candidate.Status() == wagering.Pending || candidate.Status() == wagering.PendingReference}
+					return nil
+				}
 			}
-			out = WagerResult{Transaction: existing, Balance: existing.ResultBalance(), Replayed: true, Pending: existing.Status() == wagering.Pending || existing.Status() == wagering.PendingReference}
+			// PostgreSQL lookup is authoritative, including when Redis hits or fails.
+			existing, e := tx.Transactions().ByProviderIdempotency(ctx, principal.ProviderID, in.IdempotencyKey)
+			if e == nil {
+				if existing.PayloadHash() != in.PayloadHash {
+					return ErrIdempotencyConflict
+				}
+				out = WagerResult{Transaction: existing, Balance: existing.ResultBalance(), Replayed: true, Pending: existing.Status() == wagering.Pending || existing.Status() == wagering.PendingReference}
+				return nil
+			}
+			if !errors.Is(e, ErrNotFound) {
+				return e
+			}
+			_, e = tx.Transactions().ByProviderExternal(ctx, principal.ProviderID, in.ExternalID)
+			if e == nil {
+				return ErrConflict
+			}
+			if !errors.Is(e, ErrNotFound) {
+				return e
+			}
+			w, e := tx.Wallets().ByID(ctx, in.WalletID)
+			if e != nil {
+				return e
+			}
+			if w.PlayerID() != in.PlayerID || w.Currency() != in.Amount.Currency() {
+				return shared.Error("wager.wallet_context_mismatch", shared.ErrInvalidArgument)
+			}
+			t, e := wagering.NewExternal(p)
+			if e != nil {
+				return e
+			}
+			if e = tx.Transactions().Create(ctx, t); e != nil {
+				return e
+			}
+			var source *wagering.WagerTransaction
+			if t.Kind() == wagering.Refund || t.Kind() == wagering.Rollback {
+				source, e = tx.Transactions().ByReference(ctx, principal.ProviderID, t.ReferenceExternalID())
+				if errors.Is(e, ErrNotFound) {
+					if e = t.MarkPendingReference(now); e != nil {
+						return e
+					}
+					if e = tx.Transactions().Save(ctx, t); e != nil {
+						return e
+					}
+					if e = tx.Outbox().Append(ctx, []Event{{ID: uc.ids.NewID(), Type: "WagerTransactionPendingReference", AggregateID: t.ID(), CorrelationID: t.ID(), OccurredAt: now, Data: wagerEventData(t)}}); e != nil {
+						return e
+					}
+					out = WagerResult{Transaction: t, Pending: true}
+					return nil
+				}
+				if e != nil {
+					return e
+				}
+				if e = wagering.ValidateReversal(t, source); e != nil {
+					if re := t.Reject("REFERENCE_INVALID", now); re != nil {
+						return re
+					}
+					if re := tx.Transactions().Save(ctx, t); re != nil {
+						return re
+					}
+					if re := tx.Outbox().Append(ctx, []Event{{ID: uc.ids.NewID(), Type: "WagerTransactionRejected", AggregateID: t.ID(), CorrelationID: t.ID(), OccurredAt: now, Data: wagerEventData(t)}}); re != nil {
+						return re
+					}
+					out = WagerResult{Transaction: t}
+					return nil
+				}
+			}
+			direction, changes := movementFor(t, source)
+			var final *shared.Money
+			if changes {
+				m, e := tx.Wallets().ApplyMovement(ctx, w.ID(), t.ID(), direction, t.Amount(), now)
+				if errors.Is(e, shared.ErrInsufficientFunds) {
+					failureCode := "INSUFFICIENT_FUNDS"
+					if t.Kind() == wagering.Rollback {
+						failureCode = "REVERSAL_INSUFFICIENT_FUNDS"
+					}
+					if re := t.Reject(failureCode, now); re != nil {
+						return re
+					}
+					if re := tx.Transactions().Save(ctx, t); re != nil {
+						return re
+					}
+					if re := tx.Outbox().Append(ctx, []Event{{ID: uc.ids.NewID(), Type: "WagerTransactionRejected", AggregateID: t.ID(), CorrelationID: t.ID(), OccurredAt: now, Data: wagerEventData(t)}}); re != nil {
+						return re
+					}
+					out = WagerResult{Transaction: t}
+					return nil
+				}
+				if e != nil {
+					return e
+				}
+				final = &m.Balance
+				if e = tx.Outbox().Append(ctx, []Event{{ID: uc.ids.NewID(), Type: "WalletBalanceChanged", AggregateID: w.ID(), CorrelationID: t.ID(), OccurredAt: now, Data: walletBalanceEventData(m.Entry, m.Version)}}); e != nil {
+					return e
+				}
+			} else {
+				b := w.Balance()
+				final = &b
+			}
+			if e = t.MarkProcessed(final, now); e != nil {
+				return e
+			}
+			if e = tx.Transactions().Save(ctx, t); e != nil {
+				return e
+			}
+			if e = tx.Outbox().Append(ctx, []Event{{ID: uc.ids.NewID(), Type: "WagerTransactionProcessed", AggregateID: t.ID(), CorrelationID: t.ID(), OccurredAt: now, Data: wagerEventData(t)}}); e != nil {
+				return e
+			}
+			out = WagerResult{Transaction: t, Balance: final}
 			return nil
+		}()
+		if operationErr != nil {
+			return operationErr
 		}
-		if !errors.Is(e, ErrNotFound) {
-			return e
+		if delivery != nil && out.Transaction != nil {
+			return tx.Inbox().Complete(ctx, delivery.Consumer, delivery.MessageID, out.Transaction.ID(), out.Transaction.FailureCode())
 		}
-		_, e = tx.Transactions().ByProviderExternal(ctx, principal.ProviderID, in.ExternalID)
-		if e == nil {
-			return ErrConflict
-		}
-		if !errors.Is(e, ErrNotFound) {
-			return e
-		}
-		w, e := tx.Wallets().ByID(ctx, in.WalletID)
-		if e != nil {
-			return e
-		}
-		if w.PlayerID() != in.PlayerID || w.Currency() != in.Amount.Currency() {
-			return shared.Error("wager.wallet_context_mismatch", shared.ErrInvalidArgument)
-		}
-		t, e := wagering.NewExternal(p)
-		if e != nil {
-			return e
-		}
-		if e = tx.Transactions().Create(ctx, t); e != nil {
-			return e
-		}
-		var source *wagering.WagerTransaction
-		if t.Kind() == wagering.Refund || t.Kind() == wagering.Rollback {
-			source, e = tx.Transactions().ByReference(ctx, principal.ProviderID, t.ReferenceExternalID())
-			if errors.Is(e, ErrNotFound) {
-				if e = t.MarkPendingReference(now); e != nil {
-					return e
-				}
-				if e = tx.Transactions().Save(ctx, t); e != nil {
-					return e
-				}
-				if e = tx.Outbox().Append(ctx, []Event{{ID: uc.ids.NewID(), Type: "WagerTransactionPendingReference", AggregateID: t.ID(), CorrelationID: t.ID(), OccurredAt: now, Data: wagerEventData(t)}}); e != nil {
-					return e
-				}
-				out = WagerResult{Transaction: t, Pending: true}
-				return nil
-			}
-			if e != nil {
-				return e
-			}
-			if e = wagering.ValidateReversal(t, source); e != nil {
-				if re := t.Reject("REFERENCE_INVALID", now); re != nil {
-					return re
-				}
-				if re := tx.Transactions().Save(ctx, t); re != nil {
-					return re
-				}
-				if re := tx.Outbox().Append(ctx, []Event{{ID: uc.ids.NewID(), Type: "WagerTransactionRejected", AggregateID: t.ID(), CorrelationID: t.ID(), OccurredAt: now, Data: wagerEventData(t)}}); re != nil {
-					return re
-				}
-				out = WagerResult{Transaction: t}
-				return nil
-			}
-		}
-		direction, changes := movementFor(t, source)
-		var final *shared.Money
-		if changes {
-			m, e := tx.Wallets().ApplyMovement(ctx, w.ID(), t.ID(), direction, t.Amount(), now)
-			if errors.Is(e, shared.ErrInsufficientFunds) {
-				failureCode := "INSUFFICIENT_FUNDS"
-				if t.Kind() == wagering.Rollback {
-					failureCode = "REVERSAL_INSUFFICIENT_FUNDS"
-				}
-				if re := t.Reject(failureCode, now); re != nil {
-					return re
-				}
-				if re := tx.Transactions().Save(ctx, t); re != nil {
-					return re
-				}
-				if re := tx.Outbox().Append(ctx, []Event{{ID: uc.ids.NewID(), Type: "WagerTransactionRejected", AggregateID: t.ID(), CorrelationID: t.ID(), OccurredAt: now, Data: wagerEventData(t)}}); re != nil {
-					return re
-				}
-				out = WagerResult{Transaction: t}
-				return nil
-			}
-			if e != nil {
-				return e
-			}
-			final = &m.Balance
-			if e = tx.Outbox().Append(ctx, []Event{{ID: uc.ids.NewID(), Type: "WalletBalanceChanged", AggregateID: w.ID(), CorrelationID: t.ID(), OccurredAt: now, Data: walletBalanceEventData(m.Entry, m.Version)}}); e != nil {
-				return e
-			}
-		} else {
-			b := w.Balance()
-			final = &b
-		}
-		if e = t.MarkProcessed(final, now); e != nil {
-			return e
-		}
-		if e = tx.Transactions().Save(ctx, t); e != nil {
-			return e
-		}
-		if e = tx.Outbox().Append(ctx, []Event{{ID: uc.ids.NewID(), Type: "WagerTransactionProcessed", AggregateID: t.ID(), CorrelationID: t.ID(), OccurredAt: now, Data: wagerEventData(t)}}); e != nil {
-			return e
-		}
-		out = WagerResult{Transaction: t, Balance: final}
 		return nil
 	})
 	// A concurrent request with the same idempotency key can commit after this
@@ -187,14 +247,25 @@ func (uc *SubmitWager) Execute(ctx context.Context, principal Principal, in Subm
 	if errors.Is(err, ErrConflict) {
 		var existing *wagering.WagerTransaction
 		lookupErr := uc.uow.Within(ctx, func(tx Tx) error {
+			if delivery != nil {
+				if _, startErr := tx.Inbox().Start(ctx, delivery.Consumer, delivery.MessageID, delivery.PayloadHash); startErr != nil {
+					return startErr
+				}
+			}
 			var readErr error
 			existing, readErr = tx.Transactions().ByProviderIdempotency(ctx, principal.ProviderID, in.IdempotencyKey)
-			return readErr
+			if readErr != nil {
+				return readErr
+			}
+			if existing.PayloadHash() != in.PayloadHash {
+				return ErrIdempotencyConflict
+			}
+			if delivery != nil {
+				return tx.Inbox().Complete(ctx, delivery.Consumer, delivery.MessageID, existing.ID(), existing.FailureCode())
+			}
+			return nil
 		})
 		if lookupErr == nil {
-			if existing.PayloadHash() != in.PayloadHash {
-				return WagerResult{}, ErrIdempotencyConflict
-			}
 			out = WagerResult{Transaction: existing, Balance: existing.ResultBalance(), Replayed: true, Pending: existing.Status() == wagering.Pending || existing.Status() == wagering.PendingReference}
 			err = nil
 		}

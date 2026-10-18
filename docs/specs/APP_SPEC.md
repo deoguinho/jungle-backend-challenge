@@ -6,6 +6,8 @@ Este documento descreve a organização da aplicação para o desafio [backend-c
 
 A árvore abaixo corresponde ao código existente. Esta spec continua como referência das regras funcionais e deve ser atualizada quando a implementação evoluir. As decisões devem permanecer compatíveis com o README do desafio e com [`ARCHITECTURE.md`](../../ARCHITECTURE.md), [`ARCHITECTURE_SPEC.md`](ARCHITECTURE_SPEC.md) e [`DATABASE_SPEC.md`](DATABASE_SPEC.md).
 
+O contrato HTTP atual está descrito em [OpenAPI](../openapi.yaml) e pode ser explorado pela interface Swagger UI local em `http://localhost:8082`.
+
 ## Princípios arquiteturais
 
 - **Domínio no centro:** entidades, value objects, regras e eventos de domínio não importam HTTP, SQS, Redis, PostgreSQL, Uber Fx ou bibliotecas externas.
@@ -146,7 +148,7 @@ Regras por tipo:
 Referências/reversões:
 
 - Resolver referência por `(providerId, referenceExternalTransactionId)` e conferir provider, jogador, wallet, moeda e round iguais.
-- Referência ausente cria `PENDING_REFERENCE`; retry durável aplica backoff exponencial. TTL ou máximo de tentativas, ainda a parametrizar, termina em `REJECTED` com código estável de referência não encontrada e evento de rejeição.
+- Referência ausente cria `PENDING_REFERENCE`; tentativas e próxima execução são persistidas no PostgreSQL com reagendamento progressivo. A operação expira após 24 horas e termina em `REJECTED` com código estável de referência não encontrada e evento de rejeição.
 - Referência existente em estado pendente não pode ser aplicada ainda; aguardar/reagendar. Referência `REJECTED`/`FAILED` não pode ser revertida; terminar com rejeição definitiva explicável.
 - Reversão parcial não é suportada.
 - **Política contra devolução duplicada:** uma operação de origem não pode ter duas reversões bem-sucedidas que devolvam o mesmo efeito. `REFUND` e `ROLLBACK` diretamente sobre a mesma `BET` são mutuamente exclusivos. Um `ROLLBACK` de `REFUND` deve referenciar a transação `REFUND` (não a `BET`) e desfaz o crédito dessa devolução. A regra deve ser validada no domínio e protegida por constraint/índice único no banco.
@@ -168,7 +170,7 @@ Referências/reversões:
 | `GetWallet` | principal, wallet ID | Retorna carteira somente após autorização. |
 | `ListWalletLedger` | principal, wallet ID, cursor/limit | Retorna página estável e autorizada do ledger. |
 | `SubmitWagerTransaction` | principal/provider, chave, operação | Valida autorização, normaliza/hash, coordena idempotência, processa regra e retorna resultado/replay/conflito/pendência. Usado por HTTP. |
-| `ConsumeWagerTransaction` | mensagem SQS | Valida envelope e hash, deduplica inbox e invoca o mesmo processamento de operação; confirma mensagem somente após resultado durável. |
+| `ConsumeWagerMessage` | mensagem SQS | Valida envelope e hash, inicia/conclui inbox na mesma Unit of Work do processamento financeiro; confirma SQS somente após commit. |
 | `GetWagerTransaction` | principal, transaction ID | Consulta estado e resultado sem reaplicar operação. |
 | `GetProviderWagerTransaction` | principal, external ID | Impõe isolamento do provider autenticado. |
 | `RetryPendingReference` | transação pendente | Reavalia referência, aplica operação uma vez ou agenda retry/rejeita ao atingir TTL/tentativas. |
@@ -205,7 +207,7 @@ Em Go, a convenção correta é `errors.Is()` e `errors.As()` (pacote padrão `e
 
 ### Tradução externa
 
-O adapter HTTP mapeia erros categorizados para respostas distintas: entrada inválida, não autorizado/proibido, não encontrado, conflito de idempotência, rejeição de negócio, processamento pendente e indisponibilidade transitória. Os códigos/status e formatos exatos de resposta serão definidos na spec de API. O consumer SQS trata rejeição de negócio durável como terminal/ack, falha transitória com retry e mensagem inválida/permanente segundo política documentada de DLQ.
+O adapter HTTP mapeia erros categorizados para respostas distintas: entrada inválida, não autorizado/proibido, não encontrado, conflito de idempotência, rejeição de negócio, processamento pendente e indisponibilidade transitória. Os códigos/status e formatos de resposta estão documentados em [`docs/openapi.yaml`](../openapi.yaml). O consumer SQS trata rejeição de negócio durável como terminal/ack, falha transitória com retry e mensagem inválida/permanente segundo política documentada de DLQ.
 
 ## Concorrência e atualização de saldo
 

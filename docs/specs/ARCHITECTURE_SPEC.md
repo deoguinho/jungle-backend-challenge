@@ -12,7 +12,8 @@ As decisões de domínio e os contratos abaixo derivam do enunciado do desafio; 
 |---|---|---|
 | 2026-10-16 | Redis definido como caminho de leitura rápida para idempotência, para reduzir carga de leitura no PostgreSQL. Persistência e garantias financeiras movidas para refinamento futuro. | Decisão de cache confirmada; estratégia durável pendente. |
 | 2026-10-16 | Money definido com `decimal.Decimal`; schema PostgreSQL usa `NUMERIC` validado para escala 2. Atualização de saldo aplica delta no banco para evitar lost updates. Meta de 90% de testes unitários e verificação de condições de corrida. | Decisões registradas em [`APP_SPEC.md`](APP_SPEC.md) e [`DATABASE_SPEC.md`](DATABASE_SPEC.md). |
-| 2026-10-16 | Implementados Compose/kind/MiniStack, Keycloak local, API e workers Fx, adapters pgx/Redis/SQS e migrations `000001`–`000009`. | Ver estado construído ao final deste documento; testes de integração e atomicidade da inbox ainda pendentes. |
+| 2026-10-16 | Implementados Compose/kind/MiniStack, Keycloak local, API e workers Fx, adapters pgx/Redis/SQS e migrations `000001`–`000009`. | Estrutura operacional validada com PostgreSQL e kind locais. |
+| 2026-10-17 | Inbox passa a ser iniciada/concluída na mesma Unit of Work da operação financeira; reconciliação lê saldo e ledger em uma única consulta PostgreSQL. | Integração, concorrência, retry de outbox e smoke test OIDC executados. |
 
 ## Decisões
 
@@ -53,12 +54,12 @@ API, consumidor e workers compartilham os casos de uso de domínio, mas têm pro
 
 - Redis será o caminho rápido de leitura para chaves de idempotência, reduzindo consultas repetidas ao PostgreSQL e a latência de replays.
 - O registro de idempotência conterá a chave, o hash determinístico do conteúdo e os dados do resultado necessários para responder ao replay e detectar reutilização da chave com payload divergente.
-- Redis não deve ser tratado como fonte durável única: o desafio exige que idempotência sobreviva à reinicialização dos processos. O registro durável e a coordenação entre Redis e PostgreSQL ficam pendentes para uma decisão posterior sobre persistência e garantias financeiras.
-- Política de expiração, invalidação, fallback durante indisponibilidade do Redis, consistência do cache e comportamento após cache miss serão refinados antes da implementação.
+- Redis não é fonte durável única: PostgreSQL persiste chave, hash, transação e snapshot para sobreviver à reinicialização dos processos.
+- Redis acelera lookup; cache miss ou indisponibilidade recorre ao PostgreSQL autoritativo. Escrita no cache após commit é best effort e TTL é configurável.
 
-### Persistência e garantias financeiras — pendente
+### Persistência e garantias financeiras
 
-O modelo de tabelas e constraints PostgreSQL foi detalhado em [`DATABASE_SPEC.md`](DATABASE_SPEC.md). A escolha da biblioteca de acesso, limites efetivos de transação, implementação da estratégia de concorrência e coordenação operacional entre PostgreSQL e Redis ainda serão refinados antes da implementação. A spec de banco registra as decisões propostas e as invariantes exigidas pelo desafio.
+PostgreSQL usa migrations SQL versionadas e `pgx`. A Unit of Work confirma ou reverte em conjunto transação, saldo, ledger, idempotência, outbox e inbox. O saldo muda por delta decimal em `NUMERIC`, condicionado a saldo suficiente. Constraints e triggers reforçam unicidade, referências, estados terminais e ledger append-only; detalhes estão em [`DATABASE_SPEC.md`](DATABASE_SPEC.md).
 
 ### Mensageria e eventos
 
@@ -87,7 +88,7 @@ O modelo de tabelas e constraints PostgreSQL foi detalhado em [`DATABASE_SPEC.md
 Host
 └── Docker Compose
     ├── PostgreSQL + volume
-    ├── Redis + volume/configuração de persistência a definir
+    ├── Redis 7.4 com AOF e volume nomeado `redis-data` (cache descartável; PostgreSQL é a fonte durável)
     ├── Keycloak + volume de dados local opcional
     ├── MiniStack (SQS) + persistência local opcional
     └── kind-bootstrap (Docker socket)
@@ -114,12 +115,12 @@ Os nomes abaixo são comandos-alvo para a futura implementação da infraestrutu
 9. **Validar operação**: consultar `/health/live` e `/health/ready` via porta local; autenticar via client credentials; criar carteira e submeter operações; verificar transações, ledger, inbox/outbox e mensagens no MiniStack. Exercitar reenvio idempotente e observar logs correlacionados.
 10. **Parar ambiente**: `kubectl delete` dos workloads/manifests ou `kind delete cluster --name <nome>` para remover o cluster. `docker compose down` para parar serviços. Preservar volumes em uso; para reset completo e destrutivo dos dados locais, documentar um comando separado e intencional com remoção de volumes.
 
-## Critérios de aceite da futura implementação
+## Critérios de aceite e validação executada
 
 - Um comando Compose constrói e inicia dependências e provisionador; a execução descrita provisiona o cluster sem registry externo.
 - Pelo menos três processos de aplicação independentes conseguem operar com suas próprias conexões/memória.
 - O cenário concorrente de duas apostas de 80.00 BRL sobre saldo 100.00 BRL termina com uma aposta processada, uma rejeitada, saldo 20.00 BRL e um débito no ledger.
-- A implementação deverá comprovar que reinícios de Pods não perdem idempotência; a fonte durável e a recuperação do cache serão definidas junto com a decisão de persistência.
+- PostgreSQL mantém a idempotência após reinício de processos; replay consulta o registro durável quando Redis não tem a chave.
 - Mensagens só são removidas após resultado durável; eventos são publicados via outbox e podem ser deduplicados pelo identificador estável.
 - Migrations, endpoints, autenticação por provider e encerramento gracioso têm instruções reproduzíveis.
 
@@ -129,12 +130,10 @@ Os nomes abaixo são comandos-alvo para a futura implementação da infraestrutu
 - [kind Quick Start](https://kind.sigs.k8s.io/docs/user/quick-start/) — cluster Kubernetes local baseado em containers Docker; imagens locais podem ser carregadas no cluster.
 - [MiniStack](https://github.com/ministackorg/ministack) — emulador AWS local, endpoint padrão na porta 4566, SQS e scripts de inicialização. Fixar uma versão/tag revisada na implementação, em vez de depender de `latest`.
 
-## Estado da implementacao
+## Estado da implementação
 
-A topologia descrita acima esta materializada em `compose.yaml`, `deploy/kind/`, `deploy/kubernetes/`, `deploy/keycloak/` e `deploy/ministack/`. O Compose define PostgreSQL 16, Redis 7, Keycloak 26 e MiniStack; o bootstrap cria/reutiliza um cluster kind com control-plane e dois workers, conecta os nos a rede local, gera ConfigMap/Secret, constroi/carrega a imagem, executa migrations e aplica workloads. A API fica publicada em `http://localhost:8080`.
+A topologia está materializada em `compose.yaml`, `deploy/kind/`, `deploy/kubernetes/`, `deploy/keycloak/` e `deploy/ministack/`. Compose inicia PostgreSQL 16, Redis 7, Keycloak 26 e MiniStack 1.5.28; o bootstrap cria/reutiliza kind com control-plane e dois workers, associa os nós à rede local, constrói/carrega a imagem, aplica migrations e sobe dois Pods da API e workers separados. O endpoint host padrão é `http://localhost:8088`, mapeado para a porta 8080 do container.
 
-Os binarios `cmd/api`, `cmd/worker` e `cmd/migrate` usam Uber Fx. Os adapters concretos usam `pgx`, Redis e AWS SDK SQS. Migrations `000001` a `000009` incluem o agendamento/expiracao das referencias. Redis acelera replays; PostgreSQL permanece autoritativo. A fila principal, DLQ e fila FIFO de eventos sao inicializadas em `deploy/ministack/init-sqs.sh`.
+Validação executada: `docker compose config --quiet`; `go test ./...`; `go vet ./...`; `go test -race ./...` requer `CGO_ENABLED=1` e compilador C disponível; cobertura de `internal/application` em 90,2% e pacotes de domínio entre 92,1% e 97,9%; integração PostgreSQL cobre duas apostas de 80.00 em saldo 100.00, 50 reenvios idênticos, inbox/reentrega e retry da outbox. O teste `TestThreeIndependentProcessesProtectWalletBalances` usa três processos Go e pools independentes; `TestInboxRecoveryAcrossSeparateProcesses` comita a inbox num processo e simula a reentrega em outro. O smoke OIDC verifica criação de carteira, operação e replay HTTP, SQS, inbox, reconciliação e outbox; também verifica autorização negativa e métricas. A reconciliação usa uma consulta para obter saldo e soma do ledger.
 
-Validacao realizada nesta iteracao: `docker compose config --quiet`, `go test ./...` e `go vet ./...` passaram. Os testes de dominio reportam 92.1% a 97.9%; `internal/application` reporta 3.6%, abaixo da meta de 90%. `go test -race ./...` nao foi executado com sucesso neste ambiente Windows porque nao ha compilador C (gcc) disponivel para CGO. O ambiente Docker/kind e as migrations contra PostgreSQL real ainda nao foram iniciados para teste integrado.
-
-Limites ainda abertos: a inbox e concluida em transacoes separadas da transacao financeira; a idempotencia PostgreSQL evita reaplicacao apos falha, mas o fluxo nao satisfaz atomicidade inbox + dominio descrita no README de referencia. A reconciliacao le carteira e ledger em consultas separadas e deve usar um snapshot consistente. A implementacao nao deve ser considerada como cobrindo todos os criterios de aceite antes da conclusao desses itens e dos testes de integracao, concorrencia e falha.
+A porta host da API está configurada como 8088 porque 8080 estava ocupada por um processo local (NVIDIA Broadcast); o container continua ouvindo em 8080. A API foi validada pelo host em `http://localhost:8088/health/live`. Para repetir verificações integradas, use `make test-integration TEST_DATABASE_URL=...` e `make smoke-local`.

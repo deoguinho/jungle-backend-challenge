@@ -15,6 +15,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/application"
 	"github.com/junglegaming/backend-challenge-go/internal/domain/shared"
 	"github.com/junglegaming/backend-challenge-go/internal/domain/wagering"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
 )
 
 type Readiness func(context.Context) error
@@ -29,23 +30,30 @@ type UseCases struct {
 }
 
 type Server struct {
-	auth    *Authenticator
-	use     UseCases
-	ready   Readiness
-	logger  *slog.Logger
-	handler http.Handler
+	auth           *Authenticator
+	use            UseCases
+	ready          Readiness
+	logger         *slog.Logger
+	handler        http.Handler
+	allowedOrigins map[string]struct{}
 }
 
-func NewServer(auth *Authenticator, cases UseCases, ready Readiness, logger *slog.Logger) *Server {
+func NewServer(auth *Authenticator, cases UseCases, ready Readiness, logger *slog.Logger, corsAllowedOrigins ...string) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{auth: auth, use: cases, ready: ready, logger: logger}
+	s := &Server{auth: auth, use: cases, ready: ready, logger: logger, allowedOrigins: make(map[string]struct{}, len(corsAllowedOrigins))}
+	for _, origin := range corsAllowedOrigins {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			s.allowedOrigins[origin] = struct{}{}
+		}
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "live"})
 	})
 	mux.HandleFunc("GET /health/ready", s.handleReady)
+	mux.Handle("GET /metrics", metrics.Default)
 	mux.HandleFunc("POST /wallets", s.handleOpenWallet)
 	mux.HandleFunc("GET /wallets/{walletID}", s.handleGetWallet)
 	mux.HandleFunc("GET /wallets/{walletID}/ledger", s.handleListLedger)
@@ -53,10 +61,24 @@ func NewServer(auth *Authenticator, cases UseCases, ready Readiness, logger *slo
 	mux.HandleFunc("POST /wagering/transactions", s.handleSubmitWager)
 	mux.HandleFunc("GET /wagering/transactions/{transactionID}", s.handleGetWager)
 	mux.HandleFunc("GET /providers/{providerID}/wagering/transactions/{externalTransactionID}", s.handleGetProviderWager)
-	s.handler = s.recover(mux)
+	s.handler = metrics.Default.Middleware(s.recover(mux))
 	return s
 }
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.handler.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if _, allowed := s.allowedOrigins[origin]; origin != "" && allowed {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Add("Vary", "Origin")
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key, X-Correlation-ID")
+			w.Header().Set("Access-Control-Max-Age", "600")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+	s.handler.ServeHTTP(w, r)
+}
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	if s.ready != nil {
@@ -145,6 +167,9 @@ func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.writeError(w, err)
 		return
+	}
+	if !out.Consistent {
+		metrics.Default.Inc("jungle_reconciliation_divergences_total")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"walletId": r.PathValue("walletID"), "storedBalance": moneyResponse(out.StoredBalance), "calculatedBalance": moneyResponse(out.CalculatedBalance), "difference": moneyResponse(out.Difference), "consistent": out.Consistent, "checkedEntries": out.Entries})
 }
@@ -331,17 +356,28 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 }
 func (s *Server) recover(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		correlationID := r.Header.Get("X-Correlation-ID")
+		if correlationID == "" {
+			correlationID = uuid.NewString()
+			r.Header.Set("X-Correlation-ID", correlationID)
+		}
+		w.Header().Set("X-Correlation-ID", correlationID)
+		status := &responseStatusWriter{ResponseWriter: w}
 		defer func() {
 			if v := recover(); v != nil {
-				s.logger.Error("panic recovered", "value", fmt.Sprint(v))
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"code": "internal_error", "message": "request could not be completed"})
+				s.logger.Error("panic recovered", "correlation_id", correlationID, "value", fmt.Sprint(v))
+				writeJSON(status, http.StatusInternalServerError, map[string]string{"code": "internal_error", "message": "request could not be completed"})
 			}
+			code := status.status
+			if code == 0 { code = http.StatusOK }
+			s.logger.Info("http request", "correlation_id", correlationID, "method", r.Method, "path", r.URL.Path, "status", code)
 		}()
-		if r.Header.Get("X-Correlation-ID") == "" {
-			r.Header.Set("X-Correlation-ID", uuid.NewString())
-		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(status, r)
 	})
 }
+
+type responseStatusWriter struct { http.ResponseWriter; status int }
+func (w *responseStatusWriter) WriteHeader(code int) { if w.status == 0 { w.status = code }; w.ResponseWriter.WriteHeader(code) }
+func (w *responseStatusWriter) Write(p []byte) (int, error) { if w.status == 0 { w.WriteHeader(http.StatusOK) }; return w.ResponseWriter.Write(p) }
 
 var _ http.Handler = (*Server)(nil)

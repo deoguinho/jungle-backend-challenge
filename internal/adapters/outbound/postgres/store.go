@@ -43,6 +43,12 @@ func New(ctx context.Context, databaseURL string) (*DB, error) {
 func (d *DB) Close()                         { d.pool.Close() }
 func (d *DB) Ping(ctx context.Context) error { return d.pool.Ping(ctx) }
 
+func (d *DB) OldestPendingOutboxAge(ctx context.Context) (float64, error) {
+	var seconds float64
+	err := d.pool.QueryRow(ctx, `SELECT COALESCE(EXTRACT(EPOCH FROM now()-min(created_at)),0)::float8 FROM app.outbox_events WHERE published_at IS NULL`).Scan(&seconds)
+	return seconds, translateError(err)
+}
+
 type PendingReference struct {
 	ProviderID, IdempotencyKey string
 	Expired                    bool
@@ -128,41 +134,6 @@ func (d *DB) FinishOutbox(ctx context.Context, worker, eventID string, publishEr
 	return translateError(err)
 }
 
-func (d *DB) StartInbox(ctx context.Context, consumer, messageID string, payloadHash []byte) (bool, error) {
-	tx, err := d.pool.Begin(ctx)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	_, err = tx.Exec(ctx, `INSERT INTO app.inbox_messages(consumer_name,message_id,payload_hash) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, consumer, messageID, payloadHash)
-	if err != nil {
-		return false, translateError(err)
-	}
-	var stored []byte
-	var completed *time.Time
-	if err = tx.QueryRow(ctx, `SELECT payload_hash,completed_at FROM app.inbox_messages WHERE consumer_name=$1 AND message_id=$2 FOR UPDATE`, consumer, messageID).Scan(&stored, &completed); err != nil {
-		return false, translateError(err)
-	}
-	if !equalBytes(stored, payloadHash) {
-		return false, application.ErrIdempotencyConflict
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return false, err
-	}
-	return completed != nil, nil
-}
-func (d *DB) CompleteInbox(ctx context.Context, consumer, messageID, transactionID, failureCode string) error {
-	var txID any
-	if transactionID != "" {
-		txID = transactionID
-	}
-	var failure any
-	if failureCode != "" {
-		failure = failureCode
-	}
-	_, err := d.pool.Exec(ctx, `UPDATE app.inbox_messages SET completed_at=now(),transaction_id=$3,failure_code=$4 WHERE consumer_name=$1 AND message_id=$2 AND completed_at IS NULL`, consumer, messageID, txID, failure)
-	return translateError(err)
-}
 func equalBytes(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
@@ -198,6 +169,38 @@ func (t *unitTx) Wallets() application.WalletStore           { return walletStor
 func (t *unitTx) Transactions() application.TransactionStore { return transactionStore{tx: t.tx} }
 func (t *unitTx) Ledger() application.LedgerStore            { return ledgerStore{tx: t.tx} }
 func (t *unitTx) Outbox() application.OutboxStore            { return outboxStore{tx: t.tx} }
+func (t *unitTx) Inbox() application.InboxStore              { return inboxStore{tx: t.tx} }
+
+type inboxStore struct{ tx pgx.Tx }
+
+func (s inboxStore) Start(ctx context.Context, consumer, messageID string, payloadHash []byte) (bool, error) {
+	_, err := s.tx.Exec(ctx, `INSERT INTO app.inbox_messages(consumer_name,message_id,payload_hash) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, consumer, messageID, payloadHash)
+	if err != nil {
+		return false, translateError(err)
+	}
+	var stored []byte
+	var completed *time.Time
+	if err = s.tx.QueryRow(ctx, `SELECT payload_hash,completed_at FROM app.inbox_messages WHERE consumer_name=$1 AND message_id=$2 FOR UPDATE`, consumer, messageID).Scan(&stored, &completed); err != nil {
+		return false, translateError(err)
+	}
+	if !equalBytes(stored, payloadHash) {
+		return false, application.ErrIdempotencyConflict
+	}
+	return completed != nil, nil
+}
+
+func (s inboxStore) Complete(ctx context.Context, consumer, messageID, transactionID, failureCode string) error {
+	var txID any
+	if transactionID != "" {
+		txID = transactionID
+	}
+	var failure any
+	if failureCode != "" {
+		failure = failureCode
+	}
+	_, err := s.tx.Exec(ctx, `UPDATE app.inbox_messages SET completed_at=now(),transaction_id=$3,failure_code=$4 WHERE consumer_name=$1 AND message_id=$2 AND completed_at IS NULL`, consumer, messageID, txID, failure)
+	return translateError(err)
+}
 
 type walletStore struct{ tx pgx.Tx }
 
@@ -499,15 +502,22 @@ func (s ledgerStore) walletCurrency(ctx context.Context, id string) (string, err
 	}
 	return strings.TrimSpace(cur), nil
 }
-func (s ledgerStore) Sum(ctx context.Context, walletID, currency string) (shared.Money, int64, error) {
-	var sum string
+func (s ledgerStore) Reconcile(ctx context.Context, walletID, currency string) (shared.Money, shared.Money, int64, error) {
+	var storedText, sum string
 	var count int64
-	err := s.tx.QueryRow(ctx, `SELECT COALESCE(SUM(CASE direction WHEN 'CREDIT' THEN amount ELSE -amount END),0)::text,COUNT(*) FROM app.wallet_ledger_entries WHERE wallet_id=$1`, walletID).Scan(&sum, &count)
+	err := s.tx.QueryRow(ctx, `SELECT w.balance::text,COALESCE(SUM(CASE e.direction WHEN 'CREDIT' THEN e.amount ELSE -e.amount END),0)::text,COUNT(e.id) FROM app.wallets w LEFT JOIN app.wallet_ledger_entries e ON e.wallet_id=w.id WHERE w.id=$1 GROUP BY w.balance`, walletID).Scan(&storedText, &sum, &count)
 	if err != nil {
-		return shared.Money{}, 0, translateError(err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return shared.Money{}, shared.Money{}, 0, application.ErrNotFound
+		}
+		return shared.Money{}, shared.Money{}, 0, translateError(err)
 	}
-	m, err := shared.NewMoney(sum, currency)
-	return m, count, err
+	stored, err := shared.NewMoney(storedText, currency)
+	if err != nil {
+		return shared.Money{}, shared.Money{}, 0, err
+	}
+	calculated, err := shared.NewMoney(sum, currency)
+	return stored, calculated, count, err
 }
 
 type outboxStore struct{ tx pgx.Tx }

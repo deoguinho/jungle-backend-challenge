@@ -26,7 +26,7 @@ wallets 1 ─── N wager_transactions 1 ─── 0..1 wallet_ledger_entries
                     ├── 1 ─── N outbox_events
                     └── 1 ─── 0..1 idempotency_records
 
-inbox_messages (consumer_name, message_id) é independente e deduplica entregas SQS.
+`inbox_messages` não tem relação financeira própria, mas seu registro/conclusão participa da mesma Unit of Work SQL que grava o resultado da mensagem.
 ```
 
 ## Tabelas
