@@ -131,15 +131,15 @@ func (uc *ReconcileWallet) Execute(ctx context.Context, p Principal, walletID st
 		if !p.Internal && (p.PlayerID == "" || p.PlayerID != w.PlayerID()) {
 			return ErrUnauthorized
 		}
-		calculated, count, e := tx.Ledger().Sum(ctx, walletID, w.Currency())
+		stored, calculated, count, e := tx.Ledger().Reconcile(ctx, walletID, w.Currency())
 		if e != nil {
 			return e
 		}
-		difference, e := w.Balance().Subtract(calculated)
+		difference, e := stored.Subtract(calculated)
 		if e != nil {
 			return e
 		}
-		out = Reconciliation{StoredBalance: w.Balance(), CalculatedBalance: calculated, Difference: difference, Consistent: difference.IsZero(), Entries: count}
+		out = Reconciliation{StoredBalance: stored, CalculatedBalance: calculated, Difference: difference, Consistent: difference.IsZero(), Entries: count}
 		return nil
 	})
 	return out, err

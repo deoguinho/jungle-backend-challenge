@@ -33,6 +33,18 @@ func (s *SQS) Check(ctx context.Context, queueURL string) error {
 	_, err := s.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{QueueUrl: awsconfig.String(queueURL), AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameQueueArn}})
 	return err
 }
+func (s *SQS) ApproximateMessages(ctx context.Context, queueURL string) (int64, error) {
+	if queueURL == "" {
+		return 0, fmt.Errorf("SQS queue URL is required")
+	}
+	out, err := s.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{QueueUrl: awsconfig.String(queueURL), AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameApproximateNumberOfMessages}})
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	_, err = fmt.Sscan(out.Attributes[string(types.QueueAttributeNameApproximateNumberOfMessages)], &count)
+	return count, err
+}
 func (s *SQS) Receive(ctx context.Context, queueURL string, max int32, wait, visibility int32) ([]Message, error) {
 	out, err := s.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{QueueUrl: awsconfig.String(queueURL), MaxNumberOfMessages: max, WaitTimeSeconds: wait, VisibilityTimeout: visibility})
 	if err != nil {

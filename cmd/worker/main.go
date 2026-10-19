@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/junglegaming/backend-challenge-go/internal/domain/shared"
 	"github.com/junglegaming/backend-challenge-go/internal/domain/wagering"
 	"github.com/junglegaming/backend-challenge-go/internal/platform/config"
+	"github.com/junglegaming/backend-challenge-go/internal/platform/metrics"
 	"go.uber.org/fx"
 )
 
@@ -47,7 +50,7 @@ func main() {
 		fx.Provide(func(db *pgadapter.DB) application.UnitOfWork { return db }),
 		fx.Provide(func(cache *redisadapter.Cache) application.IdempotencyCache { return cache }),
 		fx.Provide(func(uow application.UnitOfWork, ids application.IDGenerator, c application.Clock, cache application.IdempotencyCache, cfg config.Config) *application.SubmitWager {
-			return application.NewSubmitWager(uow, ids, c, cache, cfg.IdempotencyTTL)
+			return application.NewSubmitWager(uow, ids, c, cache, cfg.IdempotencyTTL, metrics.Default)
 		}),
 		fx.Provide(application.NewRetryPendingReference, application.NewExpirePendingReference),
 		fx.Invoke(startWorker),
@@ -80,12 +83,22 @@ func startWorker(lc fx.Lifecycle, cfg config.Config, db *pgadapter.DB, sqs *awsa
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	metricsServer := &http.Server{Addr: cfg.MetricsAddr, Handler: metrics.Default, ReadHeaderTimeout: 5 * time.Second}
 	lc.Append(fx.Hook{OnStart: func(context.Context) error {
+		listener, listenErr := net.Listen("tcp", cfg.MetricsAddr)
+		if listenErr != nil {
+			return listenErr
+		}
+		go func() {
+			if serveErr := metricsServer.Serve(listener); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				logger.Error("metrics server stopped unexpectedly", "error", serveErr)
+			}
+		}()
 		go func() {
 			defer close(done)
 			switch cfg.WorkerKind {
 			case "sqs-consumer":
-				runConsumer(ctx, cfg, sqs, db, submit, logger)
+				runConsumer(ctx, cfg, sqs, submit, logger)
 			case "reference":
 				runReferenceWorker(ctx, db, retry, expire, logger)
 			case "outbox-publisher":
@@ -95,6 +108,7 @@ func startWorker(lc fx.Lifecycle, cfg config.Config, db *pgadapter.DB, sqs *awsa
 		return nil
 	}, OnStop: func(stopCtx context.Context) error {
 		cancel()
+		_ = metricsServer.Shutdown(stopCtx)
 		select {
 		case <-done:
 			return nil
@@ -125,15 +139,19 @@ type wagerEnvelope struct {
 	} `json:"data"`
 }
 
-func runConsumer(ctx context.Context, cfg config.Config, client *awsadapter.SQS, db *pgadapter.DB, submit *application.SubmitWager, logger *slog.Logger) {
+func runConsumer(ctx context.Context, cfg config.Config, client *awsadapter.SQS, submit *application.SubmitWager, logger *slog.Logger) {
 	const consumerName = "wager-transaction-consumer"
 	for ctx.Err() == nil {
-		messages, err := client.Receive(ctx, cfg.SQSQueueURL, 10, 20, 60)
+		if depth, err := client.ApproximateMessages(ctx, cfg.SQSDLQURL); err == nil {
+			metrics.Default.Set("jungle_dlq_messages", float64(depth))
+		}
+		messages, err := client.Receive(ctx, cfg.SQSQueueURL, 10, 20, int32(cfg.SQSVisibilityTimeout))
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			logger.Error("receive SQS messages", "error", err)
+			metrics.Default.Inc("jungle_sqs_receive_failures_total")
 			pause(ctx, 2*time.Second)
 			continue
 		}
@@ -145,7 +163,8 @@ func runConsumer(ctx context.Context, cfg config.Config, client *awsadapter.SQS,
 			go func(message awsadapter.Message) {
 				defer workers.Done()
 				defer func() { <-sem }()
-				if err := handleMessage(ctx, cfg, client, db, submit, consumerName, message); err != nil {
+				if err := handleMessage(ctx, cfg, client, submit, consumerName, message); err != nil {
+					metrics.Default.Inc("jungle_sqs_message_retries_total")
 					logger.Error("SQS message processing failed", "message_id", message.ID, "error", err)
 				}
 			}(msg)
@@ -153,7 +172,7 @@ func runConsumer(ctx context.Context, cfg config.Config, client *awsadapter.SQS,
 		workers.Wait()
 	}
 }
-func handleMessage(ctx context.Context, cfg config.Config, client *awsadapter.SQS, db *pgadapter.DB, submit *application.SubmitWager, consumer string, msg awsadapter.Message) error {
+func handleMessage(ctx context.Context, cfg config.Config, client *awsadapter.SQS, submit *application.SubmitWager, consumer string, msg awsadapter.Message) error {
 	var envelope wagerEnvelope
 	if err := json.Unmarshal([]byte(msg.Body), &envelope); err != nil {
 		return fmt.Errorf("decode wager envelope: %w", err)
@@ -162,13 +181,6 @@ func handleMessage(ctx context.Context, cfg config.Config, client *awsadapter.SQ
 		return errors.New("invalid wager message envelope")
 	}
 	payloadHash := sha256.Sum256([]byte(msg.Body))
-	done, err := db.StartInbox(ctx, consumer, envelope.MessageID, payloadHash[:])
-	if err != nil {
-		return err
-	}
-	if done {
-		return client.Delete(ctx, cfg.SQSQueueURL, msg.Receipt)
-	}
 	amount, err := shared.NewMoney(envelope.Data.Money.Amount, envelope.Data.Money.Currency)
 	if err != nil {
 		return err
@@ -178,16 +190,8 @@ func handleMessage(ctx context.Context, cfg config.Config, client *awsadapter.SQ
 	if err != nil {
 		return err
 	}
-	result, err := submit.Execute(ctx, application.Principal{ProviderID: envelope.Data.ProviderID}, in)
+	_, err = submit.ConsumeWagerMessage(ctx, envelope.Data.ProviderID, in, application.InboxDelivery{Consumer: consumer, MessageID: envelope.MessageID, PayloadHash: payloadHash[:]})
 	if err != nil {
-		return err
-	}
-	txID, failure := "", ""
-	if result.Transaction != nil {
-		txID = result.Transaction.ID()
-		failure = result.Transaction.FailureCode()
-	}
-	if err := db.CompleteInbox(ctx, consumer, envelope.MessageID, txID, failure); err != nil {
 		return err
 	}
 	return client.Delete(ctx, cfg.SQSQueueURL, msg.Receipt)
@@ -211,6 +215,7 @@ func runReferenceWorker(ctx context.Context, db *pgadapter.DB, retry *applicatio
 					}
 				}
 				if processErr != nil {
+					metrics.Default.Inc("jungle_reference_retry_failures_total")
 					logger.Error("retry pending reference", "provider_id", item.ProviderID, "error", processErr)
 				}
 			}
@@ -221,12 +226,18 @@ func runReferenceWorker(ctx context.Context, db *pgadapter.DB, retry *applicatio
 func runOutboxPublisher(ctx context.Context, cfg config.Config, db *pgadapter.DB, sqs *awsadapter.SQS, logger *slog.Logger) {
 	workerID := uuid.NewString()
 	for ctx.Err() == nil {
+		if age, ageErr := db.OldestPendingOutboxAge(ctx); ageErr == nil {
+			metrics.Default.Set("jungle_outbox_oldest_pending_age_seconds", age)
+		}
 		events, err := db.ClaimOutbox(ctx, workerID, 50)
 		if err != nil {
 			logger.Error("claim outbox events", "error", err)
 		} else {
 			for _, record := range events {
 				err = sqs.PublishEvent(ctx, cfg.SQSEventsQueueURL, record.Event)
+				if err != nil {
+					metrics.Default.Inc("jungle_outbox_publish_retries_total")
+				}
 				if finishErr := db.FinishOutbox(ctx, workerID, record.Event.ID, err); finishErr != nil {
 					logger.Error("update outbox event", "event_id", record.Event.ID, "error", finishErr)
 				}

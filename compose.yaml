@@ -54,7 +54,7 @@ services:
     networks: [local]
 
   ministack:
-    image: ministackorg/ministack:v1.5.27
+    image: ministackorg/ministack:1.5.28
     environment:
       MINISTACK_REGION: ${AWS_REGION:-us-east-1}
       MINISTACK_HOST: ${MINISTACK_HOST:-localhost}
@@ -89,6 +89,19 @@ services:
     networks: [local]
     restart: "no"
 
+  swagger-ui:
+    image: swaggerapi/swagger-ui:v5.17.14
+    environment:
+      SWAGGER_JSON: /openapi.yaml
+      DEEP_LINKING: "true"
+      DISPLAY_REQUEST_DURATION: "true"
+    ports:
+      - "${SWAGGER_PORT:-8082}:8080"
+    volumes:
+      - ./docs/openapi.yaml:/openapi.yaml:ro
+    networks: [local]
+    restart: unless-stopped
+
   kind-bootstrap:
     build:
       context: .
@@ -108,6 +121,9 @@ services:
       OIDC_REALM: jungle
       OIDC_CLIENT_ID: jungle-api
       OIDC_CLIENT_SECRET: jungle-api-secret-local-only
+      OIDC_PROVIDER_CLIENT_ID: jungle-provider-local
+      OIDC_PROVIDER_CLIENT_SECRET: jungle-provider-secret-local-only
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:8082,http://127.0.0.1:8082}
       KEYCLOAK_PORT: ${KEYCLOAK_PORT:-8081}
       MINISTACK_HOST: ${MINISTACK_HOST:-localhost}
       MINISTACK_PORT: ${MINISTACK_PORT:-4566}

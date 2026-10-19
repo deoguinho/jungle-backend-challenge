@@ -84,6 +84,9 @@ spec:
           image: jungle-backend:local
           imagePullPolicy: IfNotPresent
           command: ["/app/worker"]
+          ports:
+            - name: metrics
+              containerPort: 9090
           envFrom:
             - configMapRef:
                 name: local-dependencies
@@ -122,6 +125,9 @@ spec:
           image: jungle-backend:local
           imagePullPolicy: IfNotPresent
           command: ["/app/worker"]
+          ports:
+            - name: metrics
+              containerPort: 9090
           envFrom:
             - configMapRef:
                 name: local-dependencies
@@ -136,6 +142,45 @@ spec:
               memory: 96Mi
             limits:
               memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-sqs-metrics
+  namespace: jungle
+spec:
+  selector:
+    app.kubernetes.io/name: jungle-worker-sqs
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-reference-metrics
+  namespace: jungle
+spec:
+  selector:
+    app.kubernetes.io/name: jungle-worker-reference
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-outbox-metrics
+  namespace: jungle
+spec:
+  selector:
+    app.kubernetes.io/name: jungle-worker-outbox
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -158,6 +203,9 @@ spec:
           image: jungle-backend:local
           imagePullPolicy: IfNotPresent
           command: ["/app/worker"]
+          ports:
+            - name: metrics
+              containerPort: 9090
           envFrom:
             - configMapRef:
                 name: local-dependencies
